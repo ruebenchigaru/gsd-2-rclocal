@@ -34,7 +34,7 @@ export const MODE_DEFAULTS: Record<WorkflowMode, Partial<GSDPreferences>> = {
       push_branches: false,
       pre_merge_check: false,
       merge_strategy: "squash",
-      isolation: "worktree",
+      isolation: "none",
     },
     unique_milestone_ids: false,
   },
@@ -44,7 +44,7 @@ export const MODE_DEFAULTS: Record<WorkflowMode, Partial<GSDPreferences>> = {
       push_branches: true,
       pre_merge_check: true,
       merge_strategy: "squash",
-      isolation: "worktree",
+      isolation: "none",
     },
     unique_milestone_ids: true,
   },
@@ -88,6 +88,9 @@ export const KNOWN_PREFERENCE_KEYS = new Set<string>([
   "widget_mode",
   "reactive_execution",
   "github",
+  "service_tier",
+  "forensics_dedup",
+  "show_token_cost",
 ]);
 
 /** Canonical list of all dispatch unit types. */
@@ -97,6 +100,7 @@ export const KNOWN_UNIT_TYPES = [
   "run-uat", "complete-milestone",
 ] as const;
 export type UnitType = (typeof KNOWN_UNIT_TYPES)[number];
+
 
 export const SKILL_ACTIONS = new Set(["use", "prefer", "avoid"]);
 
@@ -219,6 +223,12 @@ export interface GSDPreferences {
   reactive_execution?: ReactiveExecutionConfig;
   /** GitHub sync configuration. Opt-in: syncs GSD events to GitHub Issues, Milestones, and PRs. */
   github?: GitHubSyncConfig;
+  /** OpenAI service tier preference. "priority" = 2x cost, faster. "flex" = 0.5x cost, slower. Only affects gpt-5.4 models. */
+  service_tier?: "priority" | "flex";
+  /** Opt-in: search existing issues and PRs before filing from /gsd forensics. Uses additional AI tokens. */
+  forensics_dedup?: boolean;
+  /** Opt-in: show per-prompt and cumulative session token cost in the footer. Default: false. */
+  show_token_cost?: boolean;
 }
 
 export interface LoadedGSDPreferences {

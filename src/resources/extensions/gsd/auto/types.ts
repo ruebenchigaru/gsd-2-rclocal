@@ -69,6 +69,10 @@ export interface IterationContext {
   deps: LoopDeps;
   prefs: GSDPreferences | undefined;
   iteration: number;
+  /** UUID grouping all journal events for this iteration. */
+  flowId: string;
+  /** Returns the next monotonically increasing sequence number (1-based, reset per iteration). */
+  nextSeq: () => number;
 }
 
 export interface LoopState {
@@ -88,7 +92,6 @@ export interface IterationData {
   prompt: string;
   finalPrompt: string;
   pauseAfterUatDispatch: boolean;
-  observabilityIssues: unknown[];
   state: GSDState;
   mid: string | undefined;
   midTitle: string | undefined;

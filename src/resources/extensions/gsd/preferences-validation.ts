@@ -15,6 +15,7 @@ import { normalizeStringArray } from "../shared/format-utils.js";
 import {
   KNOWN_PREFERENCE_KEYS,
   KNOWN_UNIT_TYPES,
+
   SKILL_ACTIONS,
   type WorkflowMode,
   type GSDPreferences,
@@ -743,6 +744,15 @@ export function validatePreferences(preferences: GSDPreferences): {
       }
     } else {
       errors.push("github must be an object");
+    }
+  }
+
+  // ─── Show Token Cost ──────────────────────────────────────────────
+  if (preferences.show_token_cost !== undefined) {
+    if (typeof preferences.show_token_cost === "boolean") {
+      validated.show_token_cost = preferences.show_token_cost;
+    } else {
+      errors.push("show_token_cost must be a boolean");
     }
   }
 

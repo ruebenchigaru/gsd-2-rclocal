@@ -24,9 +24,15 @@ import {
 import { detectStuck } from "./detect-stuck.js";
 import { runUnit } from "./run-unit.js";
 import { debugLog } from "../debug-logger.js";
+import { PROJECT_FILES } from "../detection.js";
+import { MergeConflictError } from "../git-service.js";
+import { join } from "node:path";
+import { existsSync, cpSync } from "node:fs";
+import { logWarning, logError } from "../workflow-logger.js";
 import { gsdRoot } from "../paths.js";
 import { atomicWriteSync } from "../atomic-write.js";
-import { join } from "node:path";
+import { verifyExpectedArtifact } from "../auto-recovery.js";
+import { writeUnitRuntimeRecord } from "../unit-runtime.js";
 
 // ─── generateMilestoneReport ──────────────────────────────────────────────────
 
@@ -161,8 +167,8 @@ export async function runPreDispatch(
       debugLog("autoLoop", { phase: "exit", reason: "health-gate-failed" });
       return { action: "break", reason: "health-gate-failed" };
     }
-  } catch {
-    // Non-fatal
+  } catch (e) {
+    logWarning("engine", "Pre-dispatch health gate threw unexpectedly", { error: String(e) });
   }
 
   // Sync project root artifacts into worktree
@@ -192,6 +198,7 @@ export async function runPreDispatch(
 
   // ── Milestone transition ────────────────────────────────────────────
   if (mid && s.currentMilestoneId && mid !== s.currentMilestoneId) {
+    deps.emitJournalEvent({ ts: new Date().toISOString(), flowId: ic.flowId, seq: ic.nextSeq(), eventType: "milestone-transition", data: { from: s.currentMilestoneId, to: mid } });
     ctx.ui.notify(
       `Milestone ${s.currentMilestoneId} complete. Advancing to ${mid}: ${midTitle}.`,
       "info",
@@ -231,25 +238,23 @@ export async function runPreDispatch(
     loopState.stuckRecoveryAttempts = 0;
 
     // Worktree lifecycle on milestone transition — merge current, enter next
-    deps.resolver.mergeAndExit(s.currentMilestoneId!, ctx.ui);
-
-    // Opt-in: create draft PR on milestone completion
-    if (prefs?.git?.auto_pr) {
-      try {
-        const { createDraftPR } = await import("../git-service.js");
-        const prUrl = createDraftPR(
-          s.basePath,
-          s.currentMilestoneId!,
-          `[GSD] ${s.currentMilestoneId} complete`,
-          `Milestone ${s.currentMilestoneId} completed by GSD auto-mode.\n\nSee .gsd/${s.currentMilestoneId}/ for details.`,
+    try {
+      deps.resolver.mergeAndExit(s.currentMilestoneId!, ctx.ui);
+    } catch (mergeErr) {
+      if (mergeErr instanceof MergeConflictError) {
+        // Real code conflicts — stop the loop instead of retrying forever (#2330)
+        ctx.ui.notify(
+          `Merge conflict: ${mergeErr.conflictedFiles.join(", ")}. Resolve conflicts manually and run /gsd auto to resume.`,
+          "error",
         );
-        if (prUrl) {
-          ctx.ui.notify(`Draft PR created: ${prUrl}`, "info");
-        }
-      } catch {
-        // Non-fatal — PR creation is best-effort
+        await deps.stopAuto(ctx, pi, `Merge conflict on milestone ${s.currentMilestoneId}`);
+        return { action: "break", reason: "merge-conflict" };
       }
+      // Non-conflict merge errors — log and continue
+      logWarning("engine", "Milestone merge failed with non-conflict error", { milestone: s.currentMilestoneId!, error: String(mergeErr) });
     }
+
+    // PR creation (auto_pr) is handled inside mergeMilestoneToMain (#2302)
 
     deps.invalidateAllCaches();
 
@@ -259,9 +264,7 @@ export async function runPreDispatch(
 
     if (mid) {
       if (deps.getIsolationMode() !== "none") {
-        deps.captureIntegrationBranch(s.basePath, mid, {
-          commitDocs: prefs?.git?.commit_docs,
-        });
+        deps.captureIntegrationBranch(s.basePath, mid);
       }
       deps.resolver.enterMilestone(mid, ctx.ui);
     } else {
@@ -276,14 +279,20 @@ export async function runPreDispatch(
       .map((m: { id: string }) => m.id);
     deps.pruneQueueOrder(s.basePath, pendingIds);
 
-    // Reset completed-units tracking for the new milestone — stale entries
-    // from the previous milestone cause the dispatch loop to skip units
-    // that haven't actually been completed in the new milestone's context.
-    s.completedUnits = [];
+    // Archive the old completed-units.json instead of wiping it (#2313).
     try {
       const completedKeysPath = join(gsdRoot(s.basePath), "completed-units.json");
+      if (existsSync(completedKeysPath) && s.currentMilestoneId) {
+        const archivePath = join(
+          gsdRoot(s.basePath),
+          `completed-units-${s.currentMilestoneId}.json`,
+        );
+        cpSync(completedKeysPath, archivePath);
+      }
       atomicWriteSync(completedKeysPath, JSON.stringify([], null, 2));
-    } catch { /* non-fatal */ }
+    } catch (e) {
+      logWarning("engine", "Failed to archive completed-units on milestone transition", { error: String(e) });
+    }
 
     // Rebuild STATE.md immediately so it reflects the new active milestone.
     // This bypasses the 30-second throttle in the normal rebuild path —
@@ -291,8 +300,8 @@ export async function runPreDispatch(
     // immediate write.
     try {
       await deps.rebuildState(s.basePath);
-    } catch {
-      // Non-fatal — STATE.md will be rebuilt on the next regular cycle
+    } catch (e) {
+      logWarning("engine", "STATE.md rebuild failed after milestone transition", { error: String(e) });
     }
   }
 
@@ -322,25 +331,20 @@ export async function runPreDispatch(
     if (incomplete.length === 0 && state.registry.length > 0) {
       // All milestones complete — merge milestone branch before stopping
       if (s.currentMilestoneId) {
-        deps.resolver.mergeAndExit(s.currentMilestoneId, ctx.ui);
-
-        // Opt-in: create draft PR on milestone completion
-        if (prefs?.git?.auto_pr) {
-          try {
-            const { createDraftPR } = await import("../git-service.js");
-            const prUrl = createDraftPR(
-              s.basePath,
-              s.currentMilestoneId,
-              `[GSD] ${s.currentMilestoneId} complete`,
-              `Milestone ${s.currentMilestoneId} completed by GSD auto-mode.\n\nSee .gsd/${s.currentMilestoneId}/ for details.`,
+        try {
+          deps.resolver.mergeAndExit(s.currentMilestoneId, ctx.ui);
+        } catch (mergeErr) {
+          if (mergeErr instanceof MergeConflictError) {
+            ctx.ui.notify(
+              `Merge conflict: ${mergeErr.conflictedFiles.join(", ")}. Resolve conflicts manually and run /gsd auto to resume.`,
+              "error",
             );
-            if (prUrl) {
-              ctx.ui.notify(`Draft PR created: ${prUrl}`, "info");
-            }
-          } catch {
-            // Non-fatal — PR creation is best-effort
+            await deps.stopAuto(ctx, pi, `Merge conflict on milestone ${s.currentMilestoneId}`);
+            return { action: "break", reason: "merge-conflict" };
           }
         }
+
+        // PR creation (auto_pr) is handled inside mergeMilestoneToMain (#2302)
       }
       deps.sendDesktopNotification(
         "GSD",
@@ -386,6 +390,7 @@ export async function runPreDispatch(
       );
     }
     debugLog("autoLoop", { phase: "exit", reason: "no-active-milestone" });
+    deps.emitJournalEvent({ ts: new Date().toISOString(), flowId: ic.flowId, seq: ic.nextSeq(), eventType: "terminal", data: { reason: "no-active-milestone" } });
     return { action: "break", reason: "no-active-milestone" };
   }
 
@@ -421,25 +426,20 @@ export async function runPreDispatch(
   if (state.phase === "complete") {
     // Milestone merge on complete (before closeout so branch state is clean)
     if (s.currentMilestoneId) {
-      deps.resolver.mergeAndExit(s.currentMilestoneId, ctx.ui);
-
-      // Opt-in: create draft PR on milestone completion
-      if (prefs?.git?.auto_pr) {
-        try {
-          const { createDraftPR } = await import("../git-service.js");
-          const prUrl = createDraftPR(
-            s.basePath,
-            s.currentMilestoneId,
-            `[GSD] ${s.currentMilestoneId} complete`,
-            `Milestone ${s.currentMilestoneId} completed by GSD auto-mode.\n\nSee .gsd/${s.currentMilestoneId}/ for details.`,
+      try {
+        deps.resolver.mergeAndExit(s.currentMilestoneId, ctx.ui);
+      } catch (mergeErr) {
+        if (mergeErr instanceof MergeConflictError) {
+          ctx.ui.notify(
+            `Merge conflict: ${mergeErr.conflictedFiles.join(", ")}. Resolve conflicts manually and run /gsd auto to resume.`,
+            "error",
           );
-          if (prUrl) {
-            ctx.ui.notify(`Draft PR created: ${prUrl}`, "info");
-          }
-        } catch {
-          // Non-fatal — PR creation is best-effort
+          await deps.stopAuto(ctx, pi, `Merge conflict on milestone ${s.currentMilestoneId}`);
+          return { action: "break", reason: "merge-conflict" };
         }
       }
+
+      // PR creation (auto_pr) is handled inside mergeMilestoneToMain (#2302)
     }
     deps.sendDesktopNotification(
       "GSD",
@@ -454,6 +454,7 @@ export async function runPreDispatch(
     );
     await closeoutAndStop(ctx, pi, s, deps, `Milestone ${mid} complete`);
     debugLog("autoLoop", { phase: "exit", reason: "milestone-complete" });
+    deps.emitJournalEvent({ ts: new Date().toISOString(), flowId: ic.flowId, seq: ic.nextSeq(), eventType: "terminal", data: { reason: "milestone-complete", milestoneId: mid } });
     return { action: "break", reason: "milestone-complete" };
   }
 
@@ -465,6 +466,7 @@ export async function runPreDispatch(
     deps.sendDesktopNotification("GSD", blockerMsg, "error", "attention");
     deps.logCmuxEvent(prefs, blockerMsg, "error");
     debugLog("autoLoop", { phase: "exit", reason: "blocked" });
+    deps.emitJournalEvent({ ts: new Date().toISOString(), flowId: ic.flowId, seq: ic.nextSeq(), eventType: "terminal", data: { reason: "blocked", blockers: state.blockers } });
     return { action: "break", reason: "blocked" };
   }
 
@@ -497,6 +499,7 @@ export async function runDispatch(
   });
 
   if (dispatchResult.action === "stop") {
+    deps.emitJournalEvent({ ts: new Date().toISOString(), flowId: ic.flowId, seq: ic.nextSeq(), eventType: "dispatch-stop", rule: dispatchResult.matchedRule, data: { reason: dispatchResult.reason } });
     await closeoutAndStop(ctx, pi, s, deps, dispatchResult.reason);
     debugLog("autoLoop", { phase: "exit", reason: "dispatch-stop" });
     return { action: "break", reason: "dispatch-stop" };
@@ -507,6 +510,8 @@ export async function runDispatch(
     await new Promise((r) => setImmediate(r));
     return { action: "continue" };
   }
+
+  deps.emitJournalEvent({ ts: new Date().toISOString(), flowId: ic.flowId, seq: ic.nextSeq(), eventType: "dispatch-match", rule: dispatchResult.matchedRule, data: { unitType: dispatchResult.unitType, unitId: dispatchResult.unitId } });
 
   let unitType = dispatchResult.unitType;
   let unitId = dispatchResult.unitId;
@@ -533,7 +538,7 @@ export async function runDispatch(
       if (loopState.stuckRecoveryAttempts === 0) {
         // Level 1: try verifying the artifact, then cache invalidation + retry
         loopState.stuckRecoveryAttempts++;
-        const artifactExists = deps.verifyExpectedArtifact(
+        const artifactExists = verifyExpectedArtifact(
           unitType,
           unitId,
           s.basePath,
@@ -600,6 +605,7 @@ export async function runDispatch(
       `Pre-dispatch hook${preDispatchResult.firedHooks.length > 1 ? "s" : ""}: ${preDispatchResult.firedHooks.join(", ")}`,
       "info",
     );
+    deps.emitJournalEvent({ ts: new Date().toISOString(), flowId: ic.flowId, seq: ic.nextSeq(), eventType: "pre-dispatch-hook", data: { firedHooks: preDispatchResult.firedHooks, action: preDispatchResult.action } });
   }
   if (preDispatchResult.action === "skip") {
     ctx.ui.notify(
@@ -628,18 +634,11 @@ export async function runDispatch(
     return { action: "break", reason: "prior-slice-blocker" };
   }
 
-  const observabilityIssues = await deps.collectObservabilityWarnings(
-    ctx,
-    s.basePath,
-    unitType,
-    unitId,
-  );
-
   return {
     action: "next",
     data: {
       unitType, unitId, prompt, finalPrompt: prompt,
-      pauseAfterUatDispatch, observabilityIssues,
+      pauseAfterUatDispatch,
       state, mid, midTitle,
       isRetry: false, previousTier: undefined,
       hookModelOverride: preDispatchResult.model,
@@ -800,7 +799,7 @@ export async function runUnitPhase(
   sidecarItem?: SidecarItem,
 ): Promise<PhaseResult<{ unitStartedAt: number }>> {
   const { ctx, pi, s, deps, prefs } = ic;
-  const { unitType, unitId, prompt, observabilityIssues, state, mid } = iterData;
+  const { unitType, unitId, prompt, state, mid } = iterData;
 
   debugLog("autoLoop", {
     phase: "unit-execution",
@@ -808,6 +807,33 @@ export async function runUnitPhase(
     unitType,
     unitId,
   });
+
+  // ── Worktree health check (#1833, #1843) ────────────────────────────
+  // Verify the working directory is a valid git checkout with project
+  // files before dispatching work. A broken worktree causes agents to
+  // hallucinate summaries since they cannot read or write any files.
+  // Uses the shared PROJECT_FILES list from detection.ts to support all
+  // ecosystems (Rust, Go, Python, Java, etc.), not just JS.
+  if (s.basePath && unitType === "execute-task") {
+    const gitMarker = join(s.basePath, ".git");
+    const hasGit = deps.existsSync(gitMarker);
+    if (!hasGit) {
+      const msg = `Worktree health check failed: ${s.basePath} has no .git — refusing to dispatch ${unitType} ${unitId}`;
+      debugLog("runUnitPhase", { phase: "worktree-health-fail", basePath: s.basePath, hasGit });
+      ctx.ui.notify(msg, "error");
+      await deps.stopAuto(ctx, pi, msg);
+      return { action: "break", reason: "worktree-invalid" };
+    }
+    const hasProjectFile = PROJECT_FILES.some((f) => deps.existsSync(join(s.basePath, f)));
+    const hasSrcDir = deps.existsSync(join(s.basePath, "src"));
+    if (!hasProjectFile && !hasSrcDir) {
+      // Greenfield projects won't have project files yet — the first task creates them.
+      // Log a warning but allow execution to proceed. The .git check above is sufficient
+      // to ensure we're in a valid working directory.
+      debugLog("runUnitPhase", { phase: "worktree-health-warn-greenfield", basePath: s.basePath, hasProjectFile, hasSrcDir });
+      ctx.ui.notify(`Warning: ${s.basePath} has no recognized project files — proceeding as greenfield project`, "warning");
+    }
+  }
 
   // Detect retry and capture previous tier for escalation
   const isRetry = !!(
@@ -818,8 +844,10 @@ export async function runUnitPhase(
   const previousTier = s.currentUnitRouting?.tier;
 
   s.currentUnit = { type: unitType, id: unitId, startedAt: Date.now() };
+  const unitStartSeq = ic.nextSeq();
+  deps.emitJournalEvent({ ts: new Date().toISOString(), flowId: ic.flowId, seq: unitStartSeq, eventType: "unit-start", data: { unitType, unitId } });
   deps.captureAvailableSkills();
-  deps.writeUnitRuntimeRecord(
+  writeUnitRuntimeRecord(
     s.basePath,
     unitType,
     unitId,
@@ -831,6 +859,7 @@ export async function runUnitPhase(
       lastProgressAt: s.currentUnit.startedAt,
       progressCount: 0,
       lastProgressKind: "dispatch",
+      recoveryAttempts: 0, // Reset so re-dispatched units get full recovery budget (#2322)
     },
   );
 
@@ -876,12 +905,6 @@ export async function runUnitPhase(
     }
   }
 
-  const repairBlock =
-    deps.buildObservabilityRepairBlock(observabilityIssues);
-  if (repairBlock) {
-    finalPrompt = `${finalPrompt}${repairBlock}`;
-  }
-
   // Prompt char measurement
   s.lastPromptCharCount = finalPrompt.length;
   s.lastBaselineCharCount = undefined;
@@ -898,8 +921,8 @@ export async function runUnitPhase(
         (decisionsContent?.length ?? 0) +
         (requirementsContent?.length ?? 0) +
         (projectContent?.length ?? 0);
-    } catch {
-      // Non-fatal
+    } catch (e) {
+      logWarning("engine", "Baseline char count measurement failed", { error: String(e) });
     }
   }
 
@@ -909,9 +932,7 @@ export async function runUnitPhase(
   } catch (reorderErr) {
     const msg =
       reorderErr instanceof Error ? reorderErr.message : String(reorderErr);
-    process.stderr.write(
-      `[gsd] prompt reorder failed (non-fatal): ${msg}\n`,
-    );
+    logWarning("engine", "Prompt reorder failed", { error: msg });
   }
 
   // Select and apply model (with tier escalation on retry — normal units only)
@@ -963,7 +984,12 @@ export async function runUnitPhase(
     unitId,
     prefs,
     buildSnapshotOpts: () => deps.buildSnapshotOpts(unitType, unitId),
-    buildRecoveryContext: () => ({}),
+    buildRecoveryContext: () => ({
+      basePath: s.basePath,
+      verbose: s.verbose,
+      currentUnitStartedAt: s.currentUnit?.startedAt ?? Date.now(),
+      unitRecoveryCount: s.unitRecoveryCount,
+    }),
     pauseAuto: deps.pauseAuto,
   });
 
@@ -973,7 +999,6 @@ export async function runUnitPhase(
     deps.lockBase(),
     unitType,
     unitId,
-    s.completedUnits.length,
   );
 
   debugLog("autoLoop", {
@@ -1004,14 +1029,12 @@ export async function runUnitPhase(
     deps.lockBase(),
     unitType,
     unitId,
-    s.completedUnits.length,
     sessionFile,
   );
   deps.writeLock(
     deps.lockBase(),
     unitType,
     unitId,
-    s.completedUnits.length,
     sessionFile,
   );
 
@@ -1054,6 +1077,34 @@ export async function runUnitPhase(
     deps.buildSnapshotOpts(unitType, unitId),
   );
 
+  // ── Zero tool-call guard (#1833) ──────────────────────────────────
+  // An execute-task agent that completes with 0 tool calls made no
+  // real changes — its summary is hallucinated. Treat as failed so
+  // the task is retried instead of silently marked complete.
+  if (unitType === "execute-task") {
+    const currentLedger = deps.getLedger() as { units: Array<{ type: string; id: string; startedAt: number; toolCalls: number }> } | null;
+    if (currentLedger?.units) {
+      const lastUnit = [...currentLedger.units].reverse().find(
+        (u: { type: string; id: string; startedAt: number; toolCalls: number }) => u.type === unitType && u.id === unitId && u.startedAt === s.currentUnit!.startedAt,
+      );
+      if (lastUnit && lastUnit.toolCalls === 0) {
+        debugLog("runUnitPhase", {
+          phase: "zero-tool-calls",
+          unitType,
+          unitId,
+          warning: "Task completed with 0 tool calls — likely hallucinated, marking as failed",
+        });
+        ctx.ui.notify(
+          `${unitType} ${unitId} completed with 0 tool calls — hallucinated summary, will retry`,
+          "warning",
+        );
+        // Fall through to next iteration where dispatch will re-derive
+        // and re-dispatch this task.
+        return { action: "next", data: { unitStartedAt: s.currentUnit.startedAt } };
+      }
+    }
+  }
+
   if (s.currentUnitRouting) {
     deps.recordOutcome(
       unitType,
@@ -1062,31 +1113,16 @@ export async function runUnitPhase(
     );
   }
 
-  const isHookUnit = unitType.startsWith("hook/");
+  const skipArtifactVerification = unitType.startsWith("hook/") || unitType === "custom-step";
   const artifactVerified =
-    isHookUnit ||
-    deps.verifyExpectedArtifact(unitType, unitId, s.basePath);
+    skipArtifactVerification ||
+    verifyExpectedArtifact(unitType, unitId, s.basePath);
   if (artifactVerified) {
-    s.completedUnits.push({
-      type: unitType,
-      id: unitId,
-      startedAt: s.currentUnit.startedAt,
-      finishedAt: Date.now(),
-    });
-    if (s.completedUnits.length > 200) {
-      s.completedUnits = s.completedUnits.slice(-200);
-    }
-    // Flush completed-units to disk so the record survives crashes
-    try {
-      const completedKeysPath = join(gsdRoot(s.basePath), "completed-units.json");
-      const keys = s.completedUnits.map((u) => `${u.type}/${u.id}`);
-      atomicWriteSync(completedKeysPath, JSON.stringify(keys, null, 2));
-    } catch { /* non-fatal: disk flush failure */ }
-
-    deps.clearUnitRuntimeRecord(s.basePath, unitType, unitId);
     s.unitDispatchCount.delete(`${unitType}/${unitId}`);
     s.unitRecoveryCount.delete(`${unitType}/${unitId}`);
   }
+
+  deps.emitJournalEvent({ ts: new Date().toISOString(), flowId: ic.flowId, seq: ic.nextSeq(), eventType: "unit-end", data: { unitType, unitId, status: unitResult.status, artifactVerified }, causedBy: { flowId: ic.flowId, seq: unitStartSeq } });
 
   return { action: "next", data: { unitStartedAt: s.currentUnit.startedAt } };
 }
@@ -1126,8 +1162,8 @@ export async function runFinalize(
   // Sidecar items use lightweight pre-verification opts
   const preVerificationOpts: PreVerificationOpts | undefined = sidecarItem
     ? sidecarItem.kind === "hook"
-      ? { skipSettleDelay: true, skipDoctor: true, skipStateRebuild: true, skipWorktreeSync: true }
-      : { skipSettleDelay: true, skipStateRebuild: true }
+      ? { skipSettleDelay: true, skipWorktreeSync: true }
+      : { skipSettleDelay: true }
     : undefined;
   const preResult = await deps.postUnitPreVerification(postUnitCtx, preVerificationOpts);
   if (preResult === "dispatched") {

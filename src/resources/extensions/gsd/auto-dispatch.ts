@@ -12,7 +12,9 @@
 import type { GSDState } from "./types.js";
 import type { GSDPreferences } from "./preferences.js";
 import type { UatType } from "./files.js";
-import { loadFile, extractUatType, loadActiveOverrides, parseRoadmap } from "./files.js";
+import { loadFile, extractUatType, loadActiveOverrides } from "./files.js";
+import { isDbAvailable, getMilestoneSlices } from "./gsd-db.js";
+
 import {
   resolveMilestoneFile,
   resolveMilestonePath,
@@ -27,6 +29,7 @@ import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { hasImplementationArtifacts } from "./auto-recovery.js";
 import {
+  buildDiscussMilestonePrompt,
   buildResearchMilestonePrompt,
   buildPlanMilestonePrompt,
   buildResearchSlicePrompt,
@@ -53,9 +56,11 @@ export type DispatchAction =
       unitId: string;
       prompt: string;
       pauseAfterDispatch?: boolean;
+      /** Name of the matched dispatch rule from the unified registry (journal provenance). */
+      matchedRule?: string;
     }
-  | { action: "stop"; reason: string; level: "info" | "warning" | "error" }
-  | { action: "skip" };
+  | { action: "stop"; reason: string; level: "info" | "warning" | "error"; matchedRule?: string }
+  | { action: "skip"; matchedRule?: string };
 
 export interface DispatchContext {
   basePath: string;
@@ -66,7 +71,7 @@ export interface DispatchContext {
   session?: import("./auto/session.js").AutoSession;
 }
 
-interface DispatchRule {
+export interface DispatchRule {
   /** Human-readable name for debugging and test identification */
   name: string;
   /** Return a DispatchAction if this rule matches, null to fall through */
@@ -87,7 +92,7 @@ const MAX_REWRITE_ATTEMPTS = 3;
 
 // ─── Rules ────────────────────────────────────────────────────────────────
 
-const DISPATCH_RULES: DispatchRule[] = [
+export const DISPATCH_RULES: DispatchRule[] = [
   {
     name: "rewrite-docs (override gate)",
     match: async ({ mid, midTitle, state, basePath, session }) => {
@@ -161,6 +166,59 @@ const DISPATCH_RULES: DispatchRule[] = [
     },
   },
   {
+    name: "uat-verdict-gate (non-PASS blocks progression)",
+    match: async ({ mid, basePath, prefs }) => {
+      // Only applies when UAT dispatch is enabled
+      if (!prefs?.uat_dispatch) return null;
+
+      const roadmapFile = resolveMilestoneFile(basePath, mid, "ROADMAP");
+
+      // DB-first: get completed slices from DB
+      let completedSliceIds: string[];
+      if (isDbAvailable()) {
+        completedSliceIds = getMilestoneSlices(mid)
+          .filter(s => s.status === "complete")
+          .map(s => s.id);
+      } else {
+        return null;
+      }
+
+      for (const sliceId of completedSliceIds) {
+        const resultFile = resolveSliceFile(basePath, mid, sliceId, "UAT-RESULT");
+        if (!resultFile) continue;
+        const content = await loadFile(resultFile);
+        if (!content) continue;
+        const verdictMatch = content.match(/verdict:\s*([\w-]+)/i);
+        const verdict = verdictMatch?.[1]?.toLowerCase();
+
+        // Determine acceptable verdicts based on UAT type.
+        // mixed / human-experience / live-runtime modes may legitimately
+        // produce PARTIAL when all automatable checks pass but human-only
+        // checks remain — this should not block progression.
+        const acceptableVerdicts: string[] = ["pass", "passed"];
+        const uatFile = resolveSliceFile(basePath, mid, sliceId, "UAT");
+        if (uatFile) {
+          const uatContent = await loadFile(uatFile);
+          if (uatContent) {
+            const uatType = extractUatType(uatContent);
+            if (uatType === "mixed" || uatType === "human-experience" || uatType === "live-runtime") {
+              acceptableVerdicts.push("partial");
+            }
+          }
+        }
+
+        if (verdict && !acceptableVerdicts.includes(verdict)) {
+          return {
+            action: "stop" as const,
+            reason: `UAT verdict for ${sliceId} is "${verdict}" — blocking progression until resolved.\nReview the UAT result and update the verdict to PASS, or re-run /gsd auto after fixing.`,
+            level: "warning" as const,
+          };
+        }
+      }
+      return null;
+    },
+  },
+  {
     name: "reassess-roadmap (post-completion)",
     match: async ({ state, mid, midTitle, basePath, prefs }) => {
       if (prefs?.phases?.skip_reassess || !prefs?.phases?.reassess_after_slice)
@@ -181,27 +239,29 @@ const DISPATCH_RULES: DispatchRule[] = [
     },
   },
   {
-    name: "needs-discussion → stop",
-    match: async ({ state, mid, midTitle }) => {
+    name: "needs-discussion → discuss-milestone",
+    match: async ({ state, mid, midTitle, basePath }) => {
       if (state.phase !== "needs-discussion") return null;
       return {
-        action: "stop",
-        reason: `${mid}: ${midTitle} has draft context from a prior discussion — needs its own discussion before planning.\nRun /gsd to discuss.`,
-        level: "warning",
+        action: "dispatch",
+        unitType: "discuss-milestone",
+        unitId: mid,
+        prompt: await buildDiscussMilestonePrompt(mid, midTitle, basePath),
       };
     },
   },
   {
-    name: "pre-planning (no context) → stop",
-    match: async ({ state, mid, basePath }) => {
+    name: "pre-planning (no context) → discuss-milestone",
+    match: async ({ state, mid, midTitle, basePath }) => {
       if (state.phase !== "pre-planning") return null;
       const contextFile = resolveMilestoneFile(basePath, mid, "CONTEXT");
       const hasContext = !!(contextFile && (await loadFile(contextFile)));
       if (hasContext) return null; // fall through to next rule
       return {
-        action: "stop",
-        reason: "No context or roadmap yet. Run /gsd to discuss first.",
-        level: "warning",
+        action: "dispatch",
+        unitType: "discuss-milestone",
+        unitId: mid,
+        prompt: await buildDiscussMilestonePrompt(mid, midTitle, basePath),
       };
     },
   },
@@ -467,15 +527,19 @@ const DISPATCH_RULES: DispatchRule[] = [
       // Safety guard (#1368): verify all roadmap slices have SUMMARY files before
       // allowing milestone validation. If any slice lacks a summary, the milestone
       // is not genuinely complete — something skipped earlier slices.
-      const roadmapFile = resolveMilestoneFile(basePath, mid, "ROADMAP");
-      const roadmapContent = roadmapFile ? await loadFile(roadmapFile) : null;
-      if (roadmapContent) {
-        const roadmap = parseRoadmap(roadmapContent);
+      let sliceIds: string[];
+      if (isDbAvailable()) {
+        sliceIds = getMilestoneSlices(mid).map(s => s.id);
+      } else {
+        sliceIds = [];
+      }
+
+      if (sliceIds.length > 0) {
         const missingSlices: string[] = [];
-        for (const slice of roadmap.slices) {
-          const summaryPath = resolveSliceFile(basePath, mid, slice.id, "SUMMARY");
+        for (const sid of sliceIds) {
+          const summaryPath = resolveSliceFile(basePath, mid, sid, "SUMMARY");
           if (!summaryPath || !existsSync(summaryPath)) {
-            missingSlices.push(slice.id);
+            missingSlices.push(sid);
           }
         }
         if (missingSlices.length > 0) {
@@ -524,15 +588,19 @@ const DISPATCH_RULES: DispatchRule[] = [
       if (state.phase !== "completing-milestone") return null;
 
       // Safety guard (#1368): verify all roadmap slices have SUMMARY files.
-      const roadmapFile = resolveMilestoneFile(basePath, mid, "ROADMAP");
-      const roadmapContent = roadmapFile ? await loadFile(roadmapFile) : null;
-      if (roadmapContent) {
-        const roadmap = parseRoadmap(roadmapContent);
+      let sliceIds: string[];
+      if (isDbAvailable()) {
+        sliceIds = getMilestoneSlices(mid).map(s => s.id);
+      } else {
+        sliceIds = [];
+      }
+
+      if (sliceIds.length > 0) {
         const missingSlices: string[] = [];
-        for (const slice of roadmap.slices) {
-          const summaryPath = resolveSliceFile(basePath, mid, slice.id, "SUMMARY");
+        for (const sid of sliceIds) {
+          const summaryPath = resolveSliceFile(basePath, mid, sid, "SUMMARY");
           if (!summaryPath || !existsSync(summaryPath)) {
-            missingSlices.push(slice.id);
+            missingSlices.push(sid);
           }
         }
         if (missingSlices.length > 0) {
@@ -576,18 +644,35 @@ const DISPATCH_RULES: DispatchRule[] = [
   },
 ];
 
+import { getRegistry } from "./rule-registry.js";
+
 // ─── Resolver ─────────────────────────────────────────────────────────────
 
 /**
  * Evaluate dispatch rules in order. Returns the first matching action,
  * or a "stop" action if no rule matches (unhandled phase).
+ *
+ * Delegates to the RuleRegistry when initialized; falls back to inline
+ * loop over DISPATCH_RULES for backward compatibility (tests that import
+ * resolveDispatch directly without registry initialization).
  */
 export async function resolveDispatch(
   ctx: DispatchContext,
 ): Promise<DispatchAction> {
+  // Delegate to registry when available
+  try {
+    const registry = getRegistry();
+    return await registry.evaluateDispatch(ctx);
+  } catch {
+    // Registry not initialized — fall back to inline loop
+  }
+
   for (const rule of DISPATCH_RULES) {
     const result = await rule.match(ctx);
-    if (result) return result;
+    if (result) {
+      if (result.action !== "skip") result.matchedRule = rule.name;
+      return result;
+    }
   }
 
   // No rule matched — unhandled phase
@@ -595,6 +680,7 @@ export async function resolveDispatch(
     action: "stop",
     reason: `Unhandled phase "${ctx.state.phase}" — run /gsd doctor to diagnose.`,
     level: "info",
+    matchedRule: "<no-match>",
   };
 }
 

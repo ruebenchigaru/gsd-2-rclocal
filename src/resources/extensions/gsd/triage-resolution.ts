@@ -10,9 +10,11 @@
  * Also provides detectFileOverlap() for surfacing downstream impact on quick tasks.
  */
 
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { gsdRoot } from "./paths.js";
+import { createRequire } from "node:module";
+import { gsdRoot, milestonesDir } from "./paths.js";
+import { MILESTONE_ID_RE } from "./milestone-ids.js";
 import type { Classification, CaptureEntry } from "./captures.js";
 import {
   loadPendingCaptures,
@@ -89,19 +91,37 @@ export function executeReplan(
     const triggerPath = join(
       basePath, ".gsd", "milestones", mid, "slices", sid, `${sid}-REPLAN-TRIGGER.md`,
     );
+    const ts = new Date().toISOString();
     const content = [
       `# Replan Trigger`,
       ``,
       `**Source:** Capture ${capture.id}`,
       `**Capture:** ${capture.text}`,
       `**Rationale:** ${capture.rationale ?? "User-initiated replan via capture triage"}`,
-      `**Triggered:** ${new Date().toISOString()}`,
+      `**Triggered:** ${ts}`,
       ``,
       `This file was created by the triage pipeline. The next dispatch cycle`,
       `will detect it and enter the replanning-slice phase.`,
     ].join("\n");
 
     writeFileSync(triggerPath, content, "utf-8");
+
+    // Also write replan_triggered_at column for DB-backed detection
+    try {
+      const req = createRequire(import.meta.url);
+      const { isDbAvailable, _getAdapter } = req("./gsd-db.js");
+      if (isDbAvailable()) {
+        const adapter = _getAdapter();
+        if (adapter) {
+          adapter.prepare(
+            "UPDATE slices SET replan_triggered_at = :ts WHERE milestone_id = :mid AND id = :sid",
+          ).run({ ":ts": ts, ":mid": mid, ":sid": sid });
+        }
+      }
+    } catch {
+      // DB write is best-effort — disk file is the primary trigger for fallback path
+    }
+
     return true;
   } catch {
     return false;
@@ -165,6 +185,63 @@ export function detectFileOverlap(
   return overlappingTasks;
 }
 
+// ─── Defer Milestone Creation ─────────────────────────────────────────────────
+
+/**
+ * Ensure the milestone directory exists when triage defers a capture to a
+ * not-yet-created milestone (e.g., "M005").
+ *
+ * Creates the directory with a seed CONTEXT-DRAFT.md so that `deriveState()`
+ * discovers the milestone and enters the discussion phase instead of
+ * treating the project as fully complete.
+ *
+ * @param basePath - Project root
+ * @param targetMilestone - The milestone ID to defer to (e.g., "M005")
+ * @param captures - Captures being deferred to this milestone
+ * @returns true if the directory was created (or already existed), false on error
+ */
+export function ensureDeferMilestoneDir(
+  basePath: string,
+  targetMilestone: string,
+  captures: CaptureEntry[],
+): boolean {
+  if (!MILESTONE_ID_RE.test(targetMilestone)) return false;
+
+  const msDir = join(milestonesDir(basePath), targetMilestone);
+  if (existsSync(msDir)) return true;
+
+  try {
+    mkdirSync(msDir, { recursive: true });
+
+    // Seed CONTEXT-DRAFT.md with deferred capture context
+    const captureList = captures
+      .map(c => `- **${c.id}:** ${c.text}`)
+      .join("\n");
+
+    const draftContent = [
+      `# ${targetMilestone}: Deferred Work`,
+      ``,
+      `This milestone was created by triage when captures were deferred here.`,
+      `Discuss scope and goals before planning slices.`,
+      ``,
+      `## Deferred Captures`,
+      ``,
+      captureList || `(no captures yet)`,
+      ``,
+    ].join("\n");
+
+    writeFileSync(
+      join(msDir, `${targetMilestone}-CONTEXT-DRAFT.md`),
+      draftContent,
+      "utf-8",
+    );
+
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Load deferred captures (classification === "defer") for injection into
  * reassess-roadmap prompts.
@@ -212,6 +289,8 @@ export interface TriageExecutionResult {
   injected: number;
   /** Number of replan triggers written */
   replanned: number;
+  /** Number of defer milestone directories created */
+  deferredMilestones: number;
   /** Captures classified as quick-task that need dispatch */
   quickTasks: CaptureEntry[];
   /** Details of each action taken, for logging */
@@ -240,11 +319,44 @@ export function executeTriageResolutions(
   const result: TriageExecutionResult = {
     injected: 0,
     replanned: 0,
+    deferredMilestones: 0,
     quickTasks: [],
     actions: [],
   };
 
   const actionable = loadActionableCaptures(basePath);
+
+  // Also process deferred captures that target milestone IDs — create
+  // milestone directories so deriveState() discovers them.
+  const deferred = loadAllCaptures(basePath).filter(
+    c => c.status === "resolved" && !c.executed && c.classification === "defer",
+  );
+  if (deferred.length > 0) {
+    // Group deferred captures by target milestone
+    const byMilestone = new Map<string, CaptureEntry[]>();
+    for (const cap of deferred) {
+      const target = cap.resolution?.match(/\b(M\d{3}(?:-[a-z0-9]{6})?)\b/)?.[1];
+      if (target) {
+        const list = byMilestone.get(target) ?? [];
+        list.push(cap);
+        byMilestone.set(target, list);
+      }
+    }
+    for (const [milestoneId, captures] of byMilestone) {
+      const msDir = join(milestonesDir(basePath), milestoneId);
+      if (!existsSync(msDir)) {
+        const created = ensureDeferMilestoneDir(basePath, milestoneId, captures);
+        if (created) {
+          result.deferredMilestones++;
+          result.actions.push(`Created milestone ${milestoneId} for ${captures.length} deferred capture(s)`);
+          for (const cap of captures) {
+            markCaptureExecuted(basePath, cap.id);
+          }
+        }
+      }
+    }
+  }
+
   if (actionable.length === 0) return result;
 
   for (const capture of actionable) {

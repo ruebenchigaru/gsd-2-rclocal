@@ -32,7 +32,6 @@ export interface SessionLockData {
   unitType: string;
   unitId: string;
   unitStartedAt: string;
-  completedUnits: number;
   sessionFile?: string;
 }
 
@@ -205,7 +204,6 @@ export function acquireSessionLock(basePath: string): SessionLockResult {
     unitType: "starting",
     unitId: "bootstrap",
     unitStartedAt: new Date().toISOString(),
-    completedUnits: 0,
   };
 
   let lockfile: typeof import("proper-lockfile");
@@ -239,7 +237,7 @@ export function acquireSessionLock(basePath: string): SessionLockResult {
         const elapsed = Date.now() - _lockAcquiredAt;
         if (elapsed < 1_800_000) {
           process.stderr.write(
-            `[gsd] Lock heartbeat mismatch after ${Math.round(elapsed / 1000)}s — event loop stall, continuing.\n`,
+            `[gsd] Lock heartbeat caught up after ${Math.round(elapsed / 1000)}s — long LLM call, no action needed.\n`,
           );
           return; // Suppress false positive
         }
@@ -299,7 +297,7 @@ export function acquireSessionLock(basePath: string): SessionLockResult {
             const elapsed = Date.now() - _lockAcquiredAt;
             if (elapsed < 1_800_000) {
               process.stderr.write(
-                `[gsd] Lock heartbeat mismatch after ${Math.round(elapsed / 1000)}s — event loop stall, continuing.\n`,
+                `[gsd] Lock heartbeat caught up after ${Math.round(elapsed / 1000)}s — long LLM call, no action needed.\n`,
               );
               return;
             }
@@ -379,7 +377,6 @@ export function updateSessionLock(
   basePath: string,
   unitType: string,
   unitId: string,
-  completedUnits: number,
   sessionFile?: string,
 ): void {
   if (_lockedPath !== basePath && _lockedPath !== null) return;
@@ -392,7 +389,6 @@ export function updateSessionLock(
       unitType,
       unitId,
       unitStartedAt: new Date().toISOString(),
-      completedUnits,
       sessionFile,
     };
     atomicWriteSync(lp, JSON.stringify(data, null, 2));

@@ -14,9 +14,12 @@
  */
 
 import { existsSync, unlinkSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import type { AutoSession } from "./auto/session.js";
 import { debugLog } from "./debug-logger.js";
+import { MergeConflictError } from "./git-service.js";
+import { emitJournalEvent } from "./journal.js";
 
 // ─── Dependency Interface ──────────────────────────────────────────────────
 
@@ -28,7 +31,7 @@ export interface WorktreeResolverDeps {
     basePath: string,
     milestoneId: string,
     roadmapContent: string,
-  ) => { pushed: boolean };
+  ) => { pushed: boolean; codeFilesChanged: boolean };
   syncWorktreeStateBack: (
     mainBasePath: string,
     worktreePath: string,
@@ -63,7 +66,6 @@ export interface WorktreeResolverDeps {
   captureIntegrationBranch: (
     basePath: string,
     mid: string,
-    opts?: { commitDocs?: boolean },
   ) => void;
 }
 
@@ -155,6 +157,13 @@ export class WorktreeResolver {
         skipped: true,
         reason: "isolation-disabled",
       });
+      emitJournalEvent(this.s.originalBasePath || this.s.basePath, {
+        ts: new Date().toISOString(),
+        flowId: randomUUID(),
+        seq: 0,
+        eventType: "worktree-skip",
+        data: { milestoneId, reason: "isolation-disabled" },
+      });
       return;
     }
 
@@ -184,6 +193,13 @@ export class WorktreeResolver {
         result: "success",
         wtPath,
       });
+      emitJournalEvent(this.s.originalBasePath || this.s.basePath, {
+        ts: new Date().toISOString(),
+        flowId: randomUUID(),
+        seq: 0,
+        eventType: "worktree-enter",
+        data: { milestoneId, wtPath, created: !existingPath },
+      });
       ctx.notify(`Entered worktree for ${milestoneId} at ${wtPath}`, "info");
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -192,6 +208,13 @@ export class WorktreeResolver {
         milestoneId,
         result: "error",
         error: msg,
+      });
+      emitJournalEvent(this.s.originalBasePath || this.s.basePath, {
+        ts: new Date().toISOString(),
+        flowId: randomUUID(),
+        seq: 0,
+        eventType: "worktree-create-failed",
+        data: { milestoneId, error: msg, fallback: "project-root" },
       });
       ctx.notify(
         `Auto-worktree creation for ${milestoneId} failed: ${msg}. Continuing in project root.`,
@@ -288,6 +311,13 @@ export class WorktreeResolver {
       mode,
       basePath: this.s.basePath,
     });
+    emitJournalEvent(this.s.originalBasePath || this.s.basePath, {
+      ts: new Date().toISOString(),
+      flowId: randomUUID(),
+      seq: 0,
+      eventType: "worktree-merge-start",
+      data: { milestoneId, mode },
+    });
 
     if (mode === "none") {
       debugLog("WorktreeResolver", {
@@ -371,10 +401,23 @@ export class WorktreeResolver {
           milestoneId,
           roadmapContent,
         );
-        ctx.notify(
-          `Milestone ${milestoneId} merged to main.${mergeResult.pushed ? " Pushed to remote." : ""}`,
-          "info",
-        );
+        if (mergeResult.codeFilesChanged) {
+          ctx.notify(
+            `Milestone ${milestoneId} merged to main.${mergeResult.pushed ? " Pushed to remote." : ""}`,
+            "info",
+          );
+        } else {
+          // (#1906) Milestone produced only .gsd/ metadata — no actual code was
+          // merged. This typically means the LLM wrote planning artifacts
+          // (summaries, roadmaps) but never implemented the code. Surface this
+          // clearly so the user knows the milestone is not truly complete.
+          ctx.notify(
+            `WARNING: Milestone ${milestoneId} merged to main but contained NO code changes — only .gsd/ metadata files. ` +
+              `The milestone summary may describe planned work that was never implemented. ` +
+              `Review the milestone output and re-run if code is missing.`,
+            "warning",
+          );
+        }
       } else {
         // No roadmap at either location — teardown but PRESERVE the branch so
         // commits are not orphaned. The user can merge manually later (#1573).
@@ -395,12 +438,19 @@ export class WorktreeResolver {
         error: msg,
         fallback: "chdir-to-project-root",
       });
+      emitJournalEvent(this.s.originalBasePath || this.s.basePath, {
+        ts: new Date().toISOString(),
+        flowId: randomUUID(),
+        seq: 0,
+        eventType: "worktree-merge-failed",
+        data: { milestoneId, error: msg },
+      });
       // Surface a clear, actionable error. The worktree and milestone branch are
       // intentionally preserved — nothing has been deleted. The user can retry
-      // /complete-milestone or merge manually once the underlying issue is fixed
+      // /gsd dispatch complete-milestone or merge manually once the underlying issue is fixed
       // (e.g. checkout to wrong branch, unresolved conflicts). (#1668)
       ctx.notify(
-        `Milestone merge failed: ${msg}. Your worktree and milestone branch are preserved — retry /complete-milestone or merge manually.`,
+        `Milestone merge failed: ${msg}. Your worktree and milestone branch are preserved — retry /gsd dispatch complete-milestone or merge manually.`,
         "warning",
       );
 
@@ -420,6 +470,12 @@ export class WorktreeResolver {
         } catch {
           /* best-effort */
         }
+      }
+
+      // Re-throw MergeConflictError so the auto loop can detect real code
+      // conflicts and stop instead of retrying forever (#2330).
+      if (err instanceof MergeConflictError) {
+        throw err;
       }
     }
 
@@ -478,10 +534,18 @@ export class WorktreeResolver {
       // Rebuild GitService after merge (branch HEAD changed)
       this.rebuildGitService();
 
-      ctx.notify(
-        `Milestone ${milestoneId} merged (branch mode).${mergeResult.pushed ? " Pushed to remote." : ""}`,
-        "info",
-      );
+      if (mergeResult.codeFilesChanged) {
+        ctx.notify(
+          `Milestone ${milestoneId} merged (branch mode).${mergeResult.pushed ? " Pushed to remote." : ""}`,
+          "info",
+        );
+      } else {
+        ctx.notify(
+          `WARNING: Milestone ${milestoneId} merged (branch mode) but contained NO code changes — only .gsd/ metadata. ` +
+            `Review the milestone output and re-run if code is missing.`,
+          "warning",
+        );
+      }
       debugLog("WorktreeResolver", {
         action: "mergeAndExit",
         milestoneId,

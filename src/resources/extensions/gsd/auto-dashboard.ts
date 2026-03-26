@@ -15,14 +15,28 @@ import {
   resolveMilestoneFile,
   resolveSliceFile,
 } from "./paths.js";
-import { parseRoadmap, parsePlan } from "./files.js";
+import { isDbAvailable, getMilestoneSlices, getSliceTasks } from "./gsd-db.js";
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { truncateToWidth, visibleWidth } from "@gsd/pi-tui";
-import { makeUI, GLYPH, INDENT } from "../shared/mod.js";
+import { makeUI } from "../shared/tui.js";
+import { GLYPH, INDENT } from "../shared/mod.js";
 import { computeProgressScore } from "./progress-score.js";
 import { getActiveWorktreeName } from "./worktree-command.js";
 import { loadEffectiveGSDPreferences, getGlobalGSDPreferencesPath } from "./preferences.js";
+import { resolveServiceTierIcon, getEffectiveServiceTier } from "./service-tier.js";
+
+// ─── UAT Slice Extraction ─────────────────────────────────────────────────────
+
+/**
+ * Extract the target slice ID from a run-uat unit ID (e.g. "M001/S01" → "S01").
+ * Returns null if the format doesn't match.
+ */
+export function extractUatSliceId(unitId: string): string | null {
+  const parts = unitId.split("/");
+  if (parts.length >= 2 && parts[1]!.startsWith("S")) return parts[1]!;
+  return null;
+}
 
 // ─── Dashboard Data ───────────────────────────────────────────────────────────
 
@@ -34,7 +48,6 @@ export interface AutoDashboardData {
   startTime: number;
   elapsed: number;
   currentUnit: { type: string; id: string; startedAt: number } | null;
-  completedUnits: { type: string; id: string; startedAt: number; finishedAt: number }[];
   basePath: string;
   /** Running cost and token totals from metrics ledger */
   totalCost: number;
@@ -54,6 +67,7 @@ export interface AutoDashboardData {
 export function unitVerb(unitType: string): string {
   if (unitType.startsWith("hook/")) return `hook: ${unitType.slice(5)}`;
   switch (unitType) {
+    case "discuss-milestone": return "discussing";
     case "research-milestone":
     case "research-slice": return "researching";
     case "plan-milestone":
@@ -64,6 +78,7 @@ export function unitVerb(unitType: string): string {
     case "rewrite-docs": return "rewriting";
     case "reassess-roadmap": return "reassessing";
     case "run-uat": return "running UAT";
+    case "custom-step": return "executing workflow step";
     default: return unitType;
   }
 }
@@ -71,6 +86,7 @@ export function unitVerb(unitType: string): string {
 export function unitPhaseLabel(unitType: string): string {
   if (unitType.startsWith("hook/")) return "HOOK";
   switch (unitType) {
+    case "discuss-milestone": return "DISCUSS";
     case "research-milestone": return "RESEARCH";
     case "research-slice": return "RESEARCH";
     case "plan-milestone": return "PLAN";
@@ -81,6 +97,7 @@ export function unitPhaseLabel(unitType: string): string {
     case "rewrite-docs": return "REWRITE";
     case "reassess-roadmap": return "REASSESS";
     case "run-uat": return "UAT";
+    case "custom-step": return "WORKFLOW";
     default: return unitType.toUpperCase();
   }
 }
@@ -95,6 +112,7 @@ function peekNext(unitType: string, state: GSDState): string {
   const sid = state.activeSlice?.id ?? "";
   if (unitType.startsWith("hook/")) return `continue ${sid}`;
   switch (unitType) {
+    case "discuss-milestone": return "research or plan milestone";
     case "research-milestone": return "plan milestone roadmap";
     case "plan-milestone": return "plan or execute first slice";
     case "research-slice": return `plan ${sid}`;
@@ -229,24 +247,28 @@ let cachedSliceProgress: {
 
 export function updateSliceProgressCache(base: string, mid: string, activeSid?: string): void {
   try {
-    const roadmapFile = resolveMilestoneFile(base, mid, "ROADMAP");
-    if (!roadmapFile) return;
-    const content = readFileSync(roadmapFile, "utf-8");
-    const roadmap = parseRoadmap(content);
+    // Normalize slices: prefer DB, fall back to parser
+    type NormSlice = { id: string; done: boolean; title: string };
+    let normSlices: NormSlice[];
+    if (isDbAvailable()) {
+      normSlices = getMilestoneSlices(mid).map(s => ({ id: s.id, done: s.status === "complete", title: s.title }));
+    } else {
+      normSlices = [];
+    }
 
     let activeSliceTasks: { done: number; total: number } | null = null;
     let taskDetails: CachedTaskDetail[] | null = null;
     if (activeSid) {
       try {
-        const planFile = resolveSliceFile(base, mid, activeSid, "PLAN");
-        if (planFile && existsSync(planFile)) {
-          const planContent = readFileSync(planFile, "utf-8");
-          const plan = parsePlan(planContent);
-          activeSliceTasks = {
-            done: plan.tasks.filter(t => t.done).length,
-            total: plan.tasks.length,
-          };
-          taskDetails = plan.tasks.map(t => ({ id: t.id, title: t.title, done: t.done }));
+        if (isDbAvailable()) {
+          const dbTasks = getSliceTasks(mid, activeSid);
+          if (dbTasks.length > 0) {
+            activeSliceTasks = {
+              done: dbTasks.filter(t => t.status === "complete" || t.status === "done").length,
+              total: dbTasks.length,
+            };
+            taskDetails = dbTasks.map(t => ({ id: t.id, title: t.title, done: t.status === "complete" || t.status === "done" }));
+          }
         }
       } catch {
         // Non-fatal — just omit task count
@@ -254,8 +276,8 @@ export function updateSliceProgressCache(base: string, mid: string, activeSid?: 
     }
 
     cachedSliceProgress = {
-      done: roadmap.slices.filter(s => s.done).length,
-      total: roadmap.slices.length,
+      done: normSlices.filter(s => s.done).length,
+      total: normSlices.length,
       milestoneId: mid,
       activeSliceTasks,
       taskDetails,
@@ -408,9 +430,16 @@ export function updateProgressWidget(
   const verb = unitVerb(unitType);
   const phaseLabel = unitPhaseLabel(unitType);
   const mid = state.activeMilestone;
-  const slice = state.activeSlice;
-  const task = state.activeTask;
   const isHook = unitType.startsWith("hook/");
+
+  // When run-uat is executing for a just-completed slice (e.g. S01),
+  // deriveState() has already advanced activeSlice to the next one (S02).
+  // Override the displayed slice to match the UAT target from the unit ID.
+  const uatTargetSliceId = unitType === "run-uat" ? extractUatSliceId(unitId) : null;
+  const slice = uatTargetSliceId
+    ? { id: uatTargetSliceId, title: state.activeSlice?.title ?? "" }
+    : state.activeSlice;
+  const task = state.activeTask;
 
   // Cache git branch at widget creation time (not per render)
   let cachedBranch: string | null = null;
@@ -436,6 +465,9 @@ export function updateProgressWidget(
 
   // Pre-fetch last commit for display
   refreshLastCommit(accessors.getBasePath());
+
+  // Cache the effective service tier at widget creation time (reads preferences)
+  const effectiveServiceTier = getEffectiveServiceTier();
 
   ctx.ui.setWidget("gsd-progress", (tui, theme) => {
     let pulseBright = true;
@@ -549,9 +581,10 @@ export function updateProgressWidget(
         // Model display — shown in context section, not stats
         const modelId = cmdCtx?.model?.id ?? "";
         const modelProvider = cmdCtx?.model?.provider ?? "";
-        const modelDisplay = modelProvider && modelId
+        const tierIcon = resolveServiceTierIcon(effectiveServiceTier, modelId);
+        const modelDisplay = (modelProvider && modelId
           ? `${modelProvider}/${modelId}`
-          : modelId;
+          : modelId) + (tierIcon ? ` ${tierIcon}` : "");
 
         // ── Mode: off — return empty ──────────────────────────────────
         if (widgetMode === "off") {

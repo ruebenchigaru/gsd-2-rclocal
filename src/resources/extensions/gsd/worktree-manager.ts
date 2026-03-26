@@ -16,8 +16,10 @@
  */
 
 import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { join, resolve, sep } from "node:path";
 import { GSDError, GSD_PARSE_ERROR, GSD_STALE_STATE, GSD_LOCK_HELD, GSD_GIT_ERROR, GSD_MERGE_CONFLICT } from "./errors.js";
+import { logWarning } from "./workflow-logger.js";
 import {
   nativeBranchDelete,
   nativeBranchExists,
@@ -135,9 +137,7 @@ export function createWorktree(basePath: string, name: string, opts: { branch?: 
     // worktree can be created in its place.
     const gitFilePath = join(wtPath, ".git");
     if (!existsSync(gitFilePath)) {
-      console.error(
-        `[GSD] Removing stale worktree directory (no .git file): ${wtPath}`,
-      );
+      logWarning("reconcile", `Removing stale worktree directory (no .git file): ${wtPath}`, { worktree: name });
       rmSync(wtPath, { recursive: true, force: true });
     } else {
       throw new GSDError(GSD_STALE_STATE, `Worktree "${name}" already exists at ${wtPath}`);
@@ -286,10 +286,25 @@ export function removeWorktree(
   name: string,
   opts: { deleteBranch?: boolean; force?: boolean; branch?: string } = {},
 ): void {
-  const wtPath = worktreePath(basePath, name);
-  const resolvedWtPath = existsSync(wtPath) ? realpathSync(wtPath) : wtPath;
+  let wtPath = worktreePath(basePath, name);
   const branch = opts.branch ?? worktreeBranchName(name);
   const { deleteBranch = true, force = true } = opts;
+
+  // Resolve the ACTUAL worktree path from git's worktree list.
+  // The computed path may differ when .gsd/ is (or was) a symlink to an
+  // external state directory — git resolves symlinks at worktree creation
+  // time, so its registered path points to the resolved external location.
+  // If syncStateToProjectRoot later creates a real .gsd/ directory that
+  // shadows the symlink, the computed path diverges from git's record.
+  try {
+    const entries = nativeWorktreeList(basePath);
+    const entry = entries.find(e => e.branch === branch);
+    if (entry?.path) {
+      wtPath = entry.path;
+    }
+  } catch { /* fall back to computed path */ }
+
+  const resolvedWtPath = existsSync(wtPath) ? realpathSync(wtPath) : wtPath;
 
   // If we're inside the worktree, move out first — git can't remove an in-use directory
   const cwd = process.cwd();
@@ -306,12 +321,48 @@ export function removeWorktree(
     return;
   }
 
-  // Remove worktree (force if requested, to handle dirty worktrees)
-  try { nativeWorktreeRemove(basePath, wtPath, force); } catch { /* may fail */ }
+  // Submodule safety (#2337): detect submodules with uncommitted changes
+  // before force-removing the worktree. Force removal destroys all uncommitted
+  // state, which is especially destructive for submodule directories.
+  let hasSubmoduleChanges = false;
+  const gitmodulesPath = join(resolvedWtPath, ".gitmodules");
+  if (existsSync(gitmodulesPath)) {
+    try {
+      const submoduleStatus = execFileSync(
+        "git", ["submodule", "status"], 
+        { cwd: resolvedWtPath, stdio: ["ignore", "pipe", "pipe"], encoding: "utf-8" },
+      ).trim();
+      // Lines starting with '+' indicate uncommitted submodule changes
+      hasSubmoduleChanges = submoduleStatus.split("\n").some(
+        (line: string) => line.startsWith("+") || line.startsWith("-"),
+      );
+      if (hasSubmoduleChanges) {
+        // Stash submodule changes so they are not lost during force removal.
+        // The stash is created in the worktree before it's torn down.
+        try {
+          execFileSync(
+            "git", ["stash", "push", "-m", "gsd: auto-stash submodule changes before worktree teardown"],
+            { cwd: resolvedWtPath, stdio: ["ignore", "pipe", "pipe"], encoding: "utf-8" },
+          );
+          logWarning("reconcile", `Stashed uncommitted submodule changes before worktree teardown`, { worktree: name, path: resolvedWtPath });
+        } catch {
+          // Stash failed — warn the user that submodule changes may be lost
+          logWarning("reconcile", `Submodule changes detected — stash failed, changes may be lost during force removal`, { worktree: name, path: resolvedWtPath });
+        }
+      }
+    } catch {
+      // submodule status failed — proceed with normal removal
+    }
+  }
+
+  // Remove worktree: try non-force first when submodules have changes,
+  // falling back to force only after submodule state has been preserved.
+  const useForce = hasSubmoduleChanges ? false : force;
+  try { nativeWorktreeRemove(basePath, resolvedWtPath, useForce); } catch { /* may fail */ }
 
   // If the directory is still there (e.g. locked), try harder with force
-  if (existsSync(wtPath)) {
-    try { nativeWorktreeRemove(basePath, wtPath, true); } catch { /* may fail */ }
+  if (existsSync(resolvedWtPath)) {
+    try { nativeWorktreeRemove(basePath, resolvedWtPath, true); } catch { /* may fail */ }
   }
 
   // Prune stale entries so git knows the worktree is gone

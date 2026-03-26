@@ -8,9 +8,9 @@
 
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 
 const gsdHome = process.env.GSD_HOME || join(homedir(), ".gsd");
 
@@ -95,6 +95,92 @@ export function readRepoMeta(externalPath: string): RepoMeta | null {
   }
 }
 
+// ─── Inherited-Repo Detection ───────────────────────────────────────────────
+
+/**
+ * Check whether `basePath` is inheriting a parent directory's git repo
+ * rather than being the git root itself.
+ *
+ * Returns true when ALL of:
+ *   1. basePath is inside a git repo (git rev-parse succeeds)
+ *   2. The resolved git root is a proper ancestor of basePath
+ *   3. There is no *project* `.gsd` directory at the git root or any
+ *      intermediate ancestor (the parent project has not been
+ *      initialised with GSD)
+ *
+ * When true, the caller should run `git init` at basePath so that
+ * `repoIdentity()` produces a hash unique to this directory, preventing
+ * cross-project state leaks (#1639).
+ *
+ * When the git root already has a project `.gsd`, the directory is a
+ * legitimate subdirectory of an existing GSD project — `cd src/ && /gsd`
+ * should still load the parent project's milestones.
+ */
+export function isInheritedRepo(basePath: string): boolean {
+  try {
+    const root = resolveGitRoot(basePath);
+    const normalizedBase = canonicalizeExistingPath(basePath);
+    const normalizedRoot = canonicalizeExistingPath(root);
+    if (normalizedBase === normalizedRoot) return false; // basePath IS the root
+
+    // The git root is a proper ancestor. Check whether it already has .gsd
+    // (i.e. the parent project was initialised with GSD).
+    if (isProjectGsd(join(root, ".gsd"))) return false;
+
+    // Walk up from basePath's parent to the git root checking for .gsd.
+    // Start at dirname(normalizedBase), NOT normalizedBase itself — finding
+    // .gsd at basePath means GSD state is set up for THIS project, which
+    // says nothing about whether the git repo is inherited from an ancestor.
+    let dir = dirname(normalizedBase);
+    while (dir !== normalizedRoot && dir !== dirname(dir)) {
+      if (isProjectGsd(join(dir, ".gsd"))) return false;
+      dir = dirname(dir);
+    }
+
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Distinguish a *project* `.gsd` from the global `~/.gsd` state directory.
+ *
+ * A project `.gsd` is either:
+ *   - A symlink to an external state directory (normal post-migration layout)
+ *   - A legacy real directory that is NOT the global GSD home
+ *
+ * When the user's home directory is itself a git repo (e.g. dotfile managers),
+ * `~/.gsd` exists but is the global state directory — not a project `.gsd`.
+ * Treating it as a project `.gsd` would cause isInheritedRepo() to wrongly
+ * conclude that subdirectories are part of the home "project" (#2393).
+ */
+function isProjectGsd(gsdPath: string): boolean {
+  if (!existsSync(gsdPath)) return false;
+
+  try {
+    const stat = lstatSync(gsdPath);
+
+    // Symlinks are always project .gsd (created by ensureGsdSymlink).
+    if (stat.isSymbolicLink()) return true;
+
+    // For real directories, check that this isn't the global GSD home.
+    // Recompute gsdHome dynamically so env overrides (GSD_HOME) are
+    // picked up at call time, not just at module load time.
+    if (stat.isDirectory()) {
+      const currentGsdHome = process.env.GSD_HOME || join(homedir(), ".gsd");
+      const normalizedGsdPath = canonicalizeExistingPath(gsdPath);
+      const normalizedGsdHome = canonicalizeExistingPath(currentGsdHome);
+      if (normalizedGsdPath === normalizedGsdHome) return false;
+      return true;
+    }
+  } catch {
+    // lstat failed — treat as no .gsd present
+  }
+
+  return false;
+}
+
 // ─── Repo Identity ──────────────────────────────────────────────────────────
 
 /**
@@ -120,7 +206,8 @@ function getRemoteUrl(basePath: string): string {
  */
 function canonicalizeExistingPath(path: string): string {
   try {
-    return realpathSync(path);
+    // Use native realpath on Windows to resolve 8.3 short paths (e.g. RUNNER~1)
+    return process.platform === "win32" ? realpathSync.native(path) : realpathSync(path);
   } catch {
     return resolve(path);
   }
@@ -226,15 +313,54 @@ export function externalProjectsRoot(): string {
   return join(base, "projects");
 }
 
+// ─── Numbered Variant Cleanup ────────────────────────────────────────────────
+
+/**
+ * macOS collision pattern: `.gsd 2`, `.gsd 3`, `.gsd 4`, etc.
+ *
+ * When `symlinkSync` (or Finder) tries to create `.gsd` but a real directory
+ * already exists at that path, macOS APFS silently renames the new entry to
+ * `.gsd 2`, then `.gsd 3`, and so on. These numbered variants confuse GSD
+ * because the canonical `.gsd` path no longer resolves to the external state
+ * directory, making tracked planning files appear deleted.
+ *
+ * This helper scans the project root for entries matching `.gsd <digits>` and
+ * removes them. It is called early in `ensureGsdSymlink()` so that the
+ * canonical `.gsd` path is always the one in use.
+ */
+const GSD_NUMBERED_VARIANT_RE = /^\.gsd \d+$/;
+
+export function cleanNumberedGsdVariants(projectPath: string): string[] {
+  const removed: string[] = [];
+  try {
+    const entries = readdirSync(projectPath);
+    for (const entry of entries) {
+      if (GSD_NUMBERED_VARIANT_RE.test(entry)) {
+        const fullPath = join(projectPath, entry);
+        try {
+          rmSync(fullPath, { recursive: true, force: true });
+          removed.push(entry);
+        } catch {
+          // Best-effort: if removal fails (e.g. permissions), continue with next
+        }
+      }
+    }
+  } catch {
+    // Non-fatal: readdir failure should not block symlink creation
+  }
+  return removed;
+}
+
 // ─── Symlink Management ─────────────────────────────────────────────────────
 
 /**
  * Ensure the `<project>/.gsd` symlink points to the external state directory.
  *
- * 1. mkdir -p the external dir
- * 2. If `<project>/.gsd` doesn't exist → create symlink
- * 3. If `<project>/.gsd` is already the correct symlink → no-op
- * 4. If `<project>/.gsd` is a real directory → return as-is (migration handles later)
+ * 1. Clean up any macOS numbered collision variants (`.gsd 2`, `.gsd 3`, etc.)
+ * 2. mkdir -p the external dir
+ * 3. If `<project>/.gsd` doesn't exist → create symlink
+ * 4. If `<project>/.gsd` is already the correct symlink → no-op
+ * 5. If `<project>/.gsd` is a real directory → return as-is (migration handles later)
  *
  * Returns the resolved external path.
  */
@@ -251,6 +377,10 @@ export function ensureGsdSymlink(projectPath: string): string {
   if (localGsdNormalized === gsdHomePath) {
     return localGsd;
   }
+
+  // Clean up macOS numbered collision variants (.gsd 2, .gsd 3, etc.) before
+  // any existence checks — otherwise they accumulate and confuse state (#2205).
+  cleanNumberedGsdVariants(projectPath);
 
   // Ensure external directory exists
   mkdirSync(externalPath, { recursive: true });

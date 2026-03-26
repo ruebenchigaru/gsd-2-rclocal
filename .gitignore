@@ -4,6 +4,7 @@ package-lock.json
 .claude/
 RELEASE-GUIDE.md
 *.tgz
+*.tsbuildinfo
 .DS_Store
 Thumbs.db
 *.swp
@@ -59,6 +60,8 @@ docs/coherence-audit/
 pnpm-lock.yaml
 bun.lock
 
-# ── Personal docs ──
-local_docs/
-.openlogs/
+
+=======
+# ── GSD baseline (auto-generated) ──
+.gsd
+>>>>>>> upstream/main

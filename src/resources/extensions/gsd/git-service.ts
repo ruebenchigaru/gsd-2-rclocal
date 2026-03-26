@@ -15,6 +15,7 @@ import { gsdRoot } from "./paths.js";
 import { GIT_NO_PROMPT_ENV } from "./git-constants.js";
 import { loadEffectiveGSDPreferences } from "./preferences.js";
 
+
 import {
   detectWorktreeName,
   SLICE_BRANCH_RE,
@@ -101,23 +102,25 @@ export interface TaskCommitContext {
 
 /**
  * Build a meaningful conventional commit message from task execution context.
- * Format: `{type}({sliceId}/{taskId}): {description}`
+ * Format: `{type}: {description}` (clean conventional commit — no GSD IDs in subject).
+ *
+ * GSD metadata is placed in a `GSD-Task:` git trailer at the end of the body,
+ * following the same convention as `Signed-off-by:` or `Co-Authored-By:`.
  *
  * The description is the task summary one-liner if available (it describes
  * what was actually built), falling back to the task title (what was planned).
  */
 export function buildTaskCommitMessage(ctx: TaskCommitContext): string {
-  const scope = ctx.taskId; // e.g. "S01/T02" or just "T02"
   const description = ctx.oneLiner || ctx.taskTitle;
   const type = inferCommitType(ctx.taskTitle, ctx.oneLiner);
 
-  // Truncate description to ~72 chars for subject line
-  const maxDescLen = 68 - type.length - scope.length;
+  // Truncate description to ~72 chars for subject line (full budget without scope)
+  const maxDescLen = 70 - type.length;
   const truncated = description.length > maxDescLen
     ? description.slice(0, maxDescLen - 1).trimEnd() + "…"
     : description;
 
-  const subject = `${type}(${scope}): ${truncated}`;
+  const subject = `${type}: ${truncated}`;
 
   // Build body with key files if available
   const bodyParts: string[] = [];
@@ -130,15 +133,14 @@ export function buildTaskCommitMessage(ctx: TaskCommitContext): string {
     bodyParts.push(fileLines);
   }
 
+  // Trailers: GSD-Task first, then Resolves
+  bodyParts.push(`GSD-Task: ${ctx.taskId}`);
+
   if (ctx.issueNumber) {
     bodyParts.push(`Resolves #${ctx.issueNumber}`);
   }
 
-  if (bodyParts.length > 0) {
-    return `${subject}\n\n${bodyParts.join("\n\n")}`;
-  }
-
-  return subject;
+  return `${subject}\n\n${bodyParts.join("\n\n")}`;
 }
 
 /**
@@ -195,6 +197,10 @@ export const RUNTIME_EXCLUSION_PATHS: readonly string[] = [
   ".gsd/completed-units.json",
   ".gsd/STATE.md",
   ".gsd/gsd.db",
+  ".gsd/gsd.db-shm",   // SQLite WAL sidecar — always created alongside gsd.db (#2296)
+  ".gsd/gsd.db-wal",   // SQLite WAL sidecar — always created alongside gsd.db (#2296)
+  ".gsd/journal/",     // daily-rotated JSONL event journal (#2296)
+  ".gsd/doctor-history.jsonl", // doctor run history (#2296)
   ".gsd/DISCUSSION-MANIFEST.json",
 ];
 
@@ -244,7 +250,6 @@ export function writeIntegrationBranch(
   basePath: string,
   milestoneId: string,
   branch: string,
-  _options?: { commitDocs?: boolean },
 ): void {
   // Don't record slice branches as the integration target
   if (SLICE_BRANCH_RE.test(branch)) return;
@@ -534,7 +539,7 @@ export class GitServiceImpl {
 
     const message = taskContext
       ? buildTaskCommitMessage(taskContext)
-      : `chore(${unitId}): auto-commit after ${unitType}`;
+      : `chore: auto-commit after ${unitType}\n\nGSD-Unit: ${unitId}`;
     nativeCommit(this.basePath, message, { allowEmpty: false });
     return message;
   }
@@ -680,12 +685,17 @@ export function createDraftPR(
   milestoneId: string,
   title: string,
   body: string,
+  opts?: { head?: string; base?: string },
 ): string | null {
   try {
-    const result = execSync(
-      `gh pr create --draft --title ${JSON.stringify(title)} --body ${JSON.stringify(body)}`,
-      { cwd: basePath, encoding: "utf8", timeout: 30000, env: GIT_NO_PROMPT_ENV },
-    );
+    const args = [
+      "pr", "create", "--draft",
+      "--title", title,
+      "--body", body,
+    ];
+    if (opts?.head) args.push("--head", opts.head);
+    if (opts?.base) args.push("--base", opts.base);
+    const result = execFileSync("gh", args, { cwd: basePath, encoding: "utf8", timeout: 30000, env: GIT_NO_PROMPT_ENV });
     return result.trim();
   } catch {
     return null;

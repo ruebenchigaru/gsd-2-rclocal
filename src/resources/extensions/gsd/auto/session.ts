@@ -23,13 +23,6 @@ import type { BudgetAlertLevel } from "../auto-budget.js";
 
 // ─── Exported Types ──────────────────────────────────────────────────────────
 
-export interface CompletedUnit {
-  type: string;
-  id: string;
-  startedAt: number;
-  finishedAt: number;
-}
-
 export interface CurrentUnit {
   type: string;
   id: string;
@@ -83,6 +76,8 @@ export class AutoSession {
   paused = false;
   stepMode = false;
   verbose = false;
+  activeEngineId: string | null = null;
+  activeRunDir: string | null = null;
   cmdCtx: ExtensionCommandContext | null = null;
 
   // ── Paths ────────────────────────────────────────────────────────────────
@@ -104,7 +99,6 @@ export class AutoSession {
   // ── Current unit ─────────────────────────────────────────────────────────
   currentUnit: CurrentUnit | null = null;
   currentUnitRouting: UnitRouting | null = null;
-  completedUnits: CompletedUnit[] = [];
   currentMilestoneId: string | null = null;
 
   // ── Model state ──────────────────────────────────────────────────────────
@@ -158,14 +152,6 @@ export class AutoSession {
     return this.originalBasePath || this.basePath;
   }
 
-  completeCurrentUnit(): CompletedUnit | null {
-    if (!this.currentUnit) return null;
-    const done: CompletedUnit = { ...this.currentUnit, finishedAt: Date.now() };
-    this.completedUnits.push(done);
-    this.currentUnit = null;
-    return done;
-  }
-
   reset(): void {
     this.clearTimers();
 
@@ -174,6 +160,8 @@ export class AutoSession {
     this.paused = false;
     this.stepMode = false;
     this.verbose = false;
+    this.activeEngineId = null;
+    this.activeRunDir = null;
     this.cmdCtx = null;
 
     // Paths
@@ -189,7 +177,6 @@ export class AutoSession {
     // Unit
     this.currentUnit = null;
     this.currentUnitRouting = null;
-    this.completedUnits = [];
     this.currentMilestoneId = null;
 
     // Model
@@ -226,9 +213,10 @@ export class AutoSession {
       paused: this.paused,
       stepMode: this.stepMode,
       basePath: this.basePath,
+      activeEngineId: this.activeEngineId,
+      activeRunDir: this.activeRunDir,
       currentMilestoneId: this.currentMilestoneId,
       currentUnit: this.currentUnit,
-      completedUnits: this.completedUnits.length,
       unitDispatchCount: Object.fromEntries(this.unitDispatchCount),
     };
   }

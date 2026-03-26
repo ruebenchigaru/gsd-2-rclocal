@@ -404,6 +404,8 @@ export interface HookStatusEntry {
 
 // ─── Database Types (Decisions & Requirements) ────────────────────────────
 
+export type DecisionMadeBy = "human" | "agent" | "collaborative";
+
 export interface Decision {
   seq: number; // auto-increment primary key
   id: string; // e.g. "D001"
@@ -413,6 +415,7 @@ export interface Decision {
   choice: string; // the specific choice made
   rationale: string; // why this choice
   revisable: string; // whether/when revisable
+  made_by: DecisionMadeBy; // who made the decision: human, agent, or collaborative
   superseded_by: string | null; // ID of superseding decision, or null
 }
 
@@ -495,4 +498,62 @@ export interface BrowserFlowResult {
   checksTotal: number;
   checksPassed: number;
   duration: number;
+}
+
+// ─── Complete Task Params (gsd_complete_task tool input) ─────────────────
+
+export interface CompleteTaskParams {
+  taskId: string;
+  sliceId: string;
+  milestoneId: string;
+  oneLiner: string;
+  narrative: string;
+  verification: string;
+  keyFiles: string[];
+  keyDecisions: string[];
+  deviations: string;
+  knownIssues: string;
+  blockerDiscovered: boolean;
+  verificationEvidence: Array<{
+    command: string;
+    exitCode: number;
+    verdict: string;
+    durationMs: number;
+  }>;
+  /** Optional caller-provided identity for audit trail */
+  actorName?: string;
+  /** Optional caller-provided reason this action was triggered */
+  triggerReason?: string;
+}
+
+// ─── Complete Slice Params (gsd_complete_slice tool input) ───────────────
+
+export interface CompleteSliceParams {
+  sliceId: string;
+  milestoneId: string;
+  sliceTitle: string;
+  oneLiner: string;
+  narrative: string;
+  verification: string;
+  keyFiles: string[];
+  keyDecisions: string[];
+  patternsEstablished: string[];
+  observabilitySurfaces: string[];
+  deviations: string;
+  knownLimitations: string;
+  followUps: string;
+  requirementsAdvanced: Array<{ id: string; how: string }>;
+  requirementsValidated: Array<{ id: string; proof: string }>;
+  requirementsSurfaced: string[];
+  requirementsInvalidated: Array<{ id: string; what: string }>;
+  filesModified: Array<{ path: string; description: string }>;
+  uatContent: string;
+  provides: string[];
+  requires: Array<{ slice: string; provides: string }>;
+  affects: string[];
+  drillDownPaths: string[];
+  /** Optional caller-provided identity for audit trail */
+  actorName?: string;
+  /** Optional caller-provided reason this action was triggered */
+  triggerReason?: string;
 }

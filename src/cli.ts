@@ -2,6 +2,7 @@ import {
   AuthStorage,
   DefaultResourceLoader,
   ModelRegistry,
+  runPackageCommand,
   SettingsManager,
   SessionManager,
   createAgentSession,
@@ -9,7 +10,7 @@ import {
   runPrintMode,
   runRpcMode,
 } from '@gsd/pi-coding-agent'
-import { existsSync, readdirSync, renameSync, readFileSync } from 'node:fs'
+import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { agentDir, sessionsDir, authFilePath } from './app-paths.js'
 import { initResources, buildResourceLoader, getNewerManagedResourceVersion } from './resource-loader.js'
@@ -20,7 +21,23 @@ import { shouldRunOnboarding, runOnboarding } from './onboarding.js'
 import chalk from 'chalk'
 import { checkForUpdates } from './update-check.js'
 import { printHelp, printSubcommandHelp } from './help-text.js'
+import {
+  parseCliArgs as parseWebCliArgs,
+  runWebCliBranch,
+  migrateLegacyFlatSessions,
+} from './cli-web-branch.js'
+import { stopWebMode } from './web-mode.js'
+import { getProjectSessionsDir } from './project-sessions.js'
 import { markStartup, printStartupTimings } from './startup-timings.js'
+
+// ---------------------------------------------------------------------------
+// V8 compile cache — Node 22+ can cache compiled bytecode across runs,
+// eliminating repeated parse/compile overhead for unchanged modules.
+// Must be set early so dynamic imports (extensions, lazy subcommands) benefit.
+// ---------------------------------------------------------------------------
+if (parseInt(process.versions.node) >= 22) {
+  process.env.NODE_COMPILE_CACHE ??= join(agentDir, '.compile-cache')
+}
 
 // ---------------------------------------------------------------------------
 // Minimal CLI arg parser — detects print/subagent mode flags
@@ -37,6 +54,9 @@ interface CliFlags {
   appendSystemPrompt?: string
   tools?: string[]
   messages: string[]
+  web?: boolean
+  webPath?: string
+
   /** Set by `gsd sessions` when the user picks a specific session to resume */
   _selectedSessionPath?: string
 }
@@ -93,6 +113,12 @@ function parseCliArgs(argv: string[]): CliFlags {
     } else if (arg === '--help' || arg === '-h') {
       printHelp(process.env.GSD_VERSION || '0.0.0')
       process.exit(0)
+    } else if (arg === '--web') {
+      flags.web = true
+      // Capture optional project path after --web (not a flag)
+      if (i + 1 < args.length && !args[i + 1].startsWith('-')) {
+        flags.webPath = args[++i]
+      }
     } else if (!arg.startsWith('--') && !arg.startsWith('-')) {
       flags.messages.push(arg)
     }
@@ -110,7 +136,7 @@ exitIfManagedResourcesAreNewer(agentDir)
 // Early TTY check — must come before heavy initialization to avoid dangling
 // handles that prevent process.exit() from completing promptly.
 const hasSubcommand = cliFlags.messages.length > 0
-if (!process.stdin.isTTY && !isPrintMode && !hasSubcommand && !cliFlags.listModels) {
+if (!process.stdin.isTTY && !isPrintMode && !hasSubcommand && !cliFlags.listModels && !cliFlags.web) {
   process.stderr.write('[gsd] Error: Interactive mode requires a terminal (TTY).\n')
   process.stderr.write('[gsd] Non-interactive alternatives:\n')
   process.stderr.write('[gsd]   gsd --print "your message"     Single-shot prompt\n')
@@ -128,6 +154,19 @@ if (subcommand && process.argv.includes('--help')) {
   }
 }
 
+const packageCommand = await runPackageCommand({
+  appName: 'gsd',
+  args: process.argv.slice(2),
+  cwd: process.cwd(),
+  agentDir,
+  stdout: process.stdout,
+  stderr: process.stderr,
+  allowedCommands: new Set(['install', 'remove', 'list']),
+})
+if (packageCommand.handled) {
+  process.exit(packageCommand.exitCode)
+}
+
 // `gsd config` — replay the setup wizard and exit
 if (cliFlags.messages[0] === 'config') {
   const authStorage = AuthStorage.create(authFilePath)
@@ -142,6 +181,34 @@ if (cliFlags.messages[0] === 'update') {
   await runUpdate()
   process.exit(0)
 }
+
+// `gsd web stop [path|all]` — stop web server before anything else
+if (cliFlags.messages[0] === 'web' && cliFlags.messages[1] === 'stop') {
+  const webFlags = parseWebCliArgs(process.argv)
+  const webBranch = await runWebCliBranch(webFlags, {
+    stopWebMode,
+    stderr: process.stderr,
+    baseSessionsDir: sessionsDir,
+    agentDir,
+  })
+  if (webBranch.handled) {
+    process.exit(webBranch.exitCode)
+  }
+}
+
+// `gsd --web [path]` or `gsd web [start] [path]` — launch browser-only web mode
+if (cliFlags.web || (cliFlags.messages[0] === 'web' && cliFlags.messages[1] !== 'stop')) {
+  const webFlags = parseWebCliArgs(process.argv)
+  const webBranch = await runWebCliBranch(webFlags, {
+    stderr: process.stderr,
+    baseSessionsDir: sessionsDir,
+    agentDir,
+  })
+  if (webBranch.handled) {
+    process.exit(webBranch.exitCode)
+  }
+}
+
 
 // `gsd sessions` — list past sessions and pick one to resume
 if (cliFlags.messages[0] === 'sessions') {
@@ -478,31 +545,12 @@ if (!cliFlags.worktree && !isPrintMode) {
 // Per-directory session storage — same encoding as the upstream SDK so that
 // /resume only shows sessions from the current working directory.
 const cwd = process.cwd()
-const safePath = `--${cwd.replace(/^[/\\]/, '').replace(/[/\\:]/g, '-')}--`
-const projectSessionsDir = join(sessionsDir, safePath)
+const projectSessionsDir = getProjectSessionsDir(cwd)
 
 // Migrate legacy flat sessions: before per-directory scoping, all .jsonl session
 // files lived directly in ~/.gsd/sessions/. Move them into the correct per-cwd
 // subdirectory so /resume can find them.
-if (existsSync(sessionsDir)) {
-  try {
-    const entries = readdirSync(sessionsDir)
-    const flatJsonl = entries.filter(f => f.endsWith('.jsonl'))
-    if (flatJsonl.length > 0) {
-      const { mkdirSync } = await import('node:fs')
-      mkdirSync(projectSessionsDir, { recursive: true })
-      for (const file of flatJsonl) {
-        const src = join(sessionsDir, file)
-        const dst = join(projectSessionsDir, file)
-        if (!existsSync(dst)) {
-          renameSync(src, dst)
-        }
-      }
-    }
-  } catch {
-    // Non-fatal — don't block startup if migration fails
-  }
-}
+migrateLegacyFlatSessions(sessionsDir, projectSessionsDir)
 
 const sessionManager = cliFlags._selectedSessionPath
   ? SessionManager.open(cliFlags._selectedSessionPath, projectSessionsDir)
@@ -513,8 +561,16 @@ const sessionManager = cliFlags._selectedSessionPath
 exitIfManagedResourcesAreNewer(agentDir)
 initResources(agentDir)
 markStartup('initResources')
+
+// Overlap resource loading with session manager setup — both are independent.
+// resourceLoader.reload() is the most expensive step (jiti compilation), so
+// starting it early shaves ~50-200ms off interactive startup.
 const resourceLoader = buildResourceLoader(agentDir)
-await resourceLoader.reload()
+const resourceLoadPromise = resourceLoader.reload()
+
+// While resources load, let session manager finish any async I/O it needs.
+// Then await the resource promise before creating the agent session.
+await resourceLoadPromise
 markStartup('resourceLoader.reload')
 
 const { session, extensionsResult } = await createAgentSession({
@@ -577,8 +633,20 @@ if (enabledModelPatterns && enabledModelPatterns.length > 0) {
   }
 }
 
-// Welcome screen — shown on every fresh interactive session before TUI takes over
-{
+if (!process.stdin.isTTY) {
+  process.stderr.write('[gsd] Error: Interactive mode requires a terminal (TTY).\n')
+  process.stderr.write('[gsd] Non-interactive alternatives:\n')
+  process.stderr.write('[gsd]   gsd --print "your message"     Single-shot prompt\n')
+  process.stderr.write('[gsd]   gsd --web [path]               Browser-only web mode\n')
+  process.stderr.write('[gsd]   gsd --mode rpc                 JSON-RPC over stdin/stdout\n')
+  process.stderr.write('[gsd]   gsd --mode mcp                 MCP server over stdin/stdout\n')
+  process.stderr.write('[gsd]   gsd --mode text "message"      Text output mode\n')
+  process.exit(1)
+}
+
+// Welcome screen — shown on every fresh interactive session before TUI takes over.
+// Skip when the first-run banner was already printed in loader.ts (prevents double banner).
+if (!process.env.GSD_FIRST_RUN_BANNER) {
   const { printWelcomeScreen } = await import('./welcome-screen.js')
   printWelcomeScreen({
     version: process.env.GSD_VERSION || '0.0.0',
